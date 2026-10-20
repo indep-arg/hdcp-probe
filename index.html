@@ -1,0 +1,465 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="description" content="Check whether HDCP actually works between your GPU and your display, straight from the browser.">
+<title>hdcp-probe</title>
+<!--
+  hdcp-probe: check whether HDCP actually works on your display chain, from the browser.
+  https://github.com/indep-arg/hdcp-probe
+  MIT License.
+
+  Two tests:
+  1. Policy query: EME MediaKeys.getStatusForPolicy({minHdcpVersion}) per CDM.
+  2. Real license: plays a PlayReady-protected clip from Microsoft's public test
+     server with licenses that require HDCP, and watches what the CDM does.
+  Nothing on the system is changed. It only asks and plays.
+-->
+<style>
+  html { background:#fff; color:#111; }
+  body { font: 14px/1.45 Consolas, "DejaVu Sans Mono", Menlo, monospace; margin: 16px; max-width: 1000px; }
+  h1 { font-size: 16px; margin: 0 0 4px; }
+  h2 { font-size: 14px; margin: 24px 0 6px; border-bottom: 1px solid #999; }
+  p { margin: 4px 0; }
+  a { color:#00e; }
+  button { font: inherit; padding: 2px 10px; margin: 8px 6px 0 0; }
+  label { margin-right: 12px; }
+  table { border-collapse: collapse; margin: 4px 0; }
+  th, td { border: 1px solid #bbb; padding: 2px 8px; text-align: left; vertical-align: top; }
+  th { background: #eee; font-weight: normal; }
+  .scroll { overflow-x: auto; }
+  .y { color:#070; } .n { color:#b00; } .w { color:#a60; } .g { color:#777; }
+  pre { background:#f4f4f4; border:1px solid #ddd; padding:8px; white-space: pre-wrap; margin: 4px 0; }
+  ul { margin: 4px 0; padding-left: 20px; }
+  video { display:block; margin-top:8px; background:#000; max-width:100%; }
+  footer { margin-top: 32px; }
+  @media (prefers-color-scheme: dark) {
+    html { background:#1b1b1b; color:#ddd; }
+    th { background:#2a2a2a; } th, td { border-color:#444; } h2 { border-color:#555; }
+    pre { background:#222; border-color:#333; } a { color:#8ab4f8; }
+    .y { color:#6c6; } .n { color:#f77; } .w { color:#fc6; } .g { color:#888; }
+  }
+</style>
+</head>
+<body>
+<h1>hdcp-probe</h1>
+<p class="g">Checks whether HDCP actually works between your GPU and your display. Use a normal window (not InPrivate/Incognito). On Windows, Edge is the only browser with hardware PlayReady, which is what streaming services use for 1080p and 4K.</p>
+<button id="txt" disabled>Copy report</button><button id="json" disabled>Copy JSON</button>
+
+<h2>1. Policy query</h2>
+<p class="g">Asks each DRM system which HDCP version it could enforce right now. Fast, but it is a hypothetical question and some CDMs answer it badly.</p>
+<button id="run">Run policy query</button>
+<div id="out"></div>
+
+<h2>2. Real license test (PlayReady)</h2>
+<p class="g">Plays a protected clip from Microsoft's public PlayReady test server three times: without restrictions (control), requiring HDCP, and requiring HDCP 2.2. If the clip plays with the license that requires HDCP, HDCP works. This is the same check a streaming service does. Edge on Windows only. Keep this tab visible while it runs.</p>
+<p>
+  <label><input type="checkbox" id="lic-hw" checked> hardware (SL3000)</label>
+  <label><input type="checkbox" id="lic-sw"> software (SL2000)</label>
+</p>
+<button id="lic-run">Run license test</button>
+<div id="lic-out"></div>
+<video id="lic-video" muted playsinline width="320"></video>
+
+<footer class="g">
+  <a href="https://github.com/indep-arg/hdcp-probe">source</a> ·
+  <a href="https://github.com/indep-arg/hdcp-probe#reading-the-results">how to read the results</a> ·
+  <a href="https://github.com/indep-arg/hdcp-probe/issues/new?template=report.yml">share your result</a>
+</footer>
+
+<script>
+'use strict';
+const VERSIONS = ['1.0','1.1','1.2','1.3','1.4','2.0','2.1','2.2','2.3'];
+const H264 = 'video/mp4; codecs="avc1.640028"';
+const HEVC = 'video/mp4; codecs="hvc1.2.4.L153.B0"';
+const AAC  = 'audio/mp4; codecs="mp4a.40.2"';
+const esc = s => String(s).replace(/[&<>"]/g, ch => ({ '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;' }[ch]));
+
+// Some hardware CDMs want distinctiveIdentifier 'required', so SL3000 is tried both ways.
+const PROFILES = [
+  { id:'wv-sw',    name:'Widevine SW (L3)',               ks:['com.widevine.alpha'], rob:'SW_SECURE_DECODE', hw:false, di:'optional' },
+  { id:'wv-hw',    name:'Widevine HW (L1)',               ks:['com.widevine.alpha'], rob:'HW_SECURE_ALL',    hw:true,  di:'optional' },
+  { id:'pr-2000',  name:'PlayReady SL2000',               ks:['com.microsoft.playready.recommendation','com.microsoft.playready'], rob:'2000', hw:false, di:'optional' },
+  { id:'pr-3000',  name:'PlayReady SL3000',               ks:['com.microsoft.playready.recommendation.3000','com.microsoft.playready.recommendation','com.microsoft.playready.hardware'], rob:'3000', hw:true, di:'optional' },
+  { id:'pr-3000r', name:'PlayReady SL3000 (DI required)', ks:['com.microsoft.playready.recommendation.3000','com.microsoft.playready.recommendation'], rob:'3000', hw:true, di:'required' },
+];
+
+const cfg = (p, codec) => [{
+  initDataTypes: ['cenc'],
+  distinctiveIdentifier: p.di,
+  persistentState: 'optional',
+  videoCapabilities: [{ contentType: codec, robustness: p.rob }],
+  audioCapabilities: [{ contentType: AAC }]
+}];
+
+async function open(p) {
+  const errs = [];
+  for (const ks of p.ks) {
+    try { return { acc: await navigator.requestMediaKeySystemAccess(ks, cfg(p, H264)), ks }; }
+    catch (e) { errs.push(`${ks}: ${e.name}`); }
+  }
+  throw new Error(errs.join('; '));
+}
+
+async function probe(p) {
+  const r = { id:p.id, name:p.name, hw:p.hw, ok:false, ks:null, hevc:null, control:null, hdcp:{}, ms:0, err:null };
+  const t0 = performance.now();
+  let o;
+  try { o = await open(p); } catch (e) { r.err = e.message; return r; }
+  r.ks = o.ks;
+  let keys;
+  try { keys = await o.acc.createMediaKeys(); } catch (e) { r.err = `createMediaKeys: ${e.name}`; return r; }
+  r.ok = true;
+  try { await navigator.requestMediaKeySystemAccess(o.ks, cfg(p, HEVC)); r.hevc = true; } catch { r.hevc = false; }
+  if (typeof keys.getStatusForPolicy !== 'function') { r.err = 'getStatusForPolicy not implemented'; return r; }
+  // Empty policy = control. If this is already restricted, this profile can't measure HDCP.
+  try { r.control = await keys.getStatusForPolicy({}); } catch (e) { r.control = `error ${e.name}`; }
+  for (const v of VERSIONS) {
+    try { r.hdcp[v] = await keys.getStatusForPolicy({ minHdcpVersion: v }); }
+    catch (e) { r.hdcp[v] = `error ${e.name}`; }
+  }
+  r.ms = Math.round(performance.now() - t0);
+  return r;
+}
+
+const maxOk = h => { let m = null; for (const v of VERSIONS) if (h[v] === 'usable') m = v; return m; };
+const reliable = r => r.ok && r.control === 'usable';
+const c = s => s === 'usable' ? 'y' : (!s || s.startsWith('error')) ? 'g' : 'n';
+
+async function decodeInfo() {
+  if (!navigator.mediaCapabilities) return [];
+  const list = [['H.264 1080p', H264, 1920, 1080], ['HEVC 2160p', HEVC, 3840, 2160]];
+  const out = [];
+  for (const [name, ct, w, h] of list) {
+    try {
+      const i = await navigator.mediaCapabilities.decodingInfo({ type:'media-source', video:{ contentType:ct, width:w, height:h, bitrate:15e6, framerate:24 } });
+      out.push({ name, supported:i.supported, smooth:i.smooth, hw:i.powerEfficient });
+    } catch (e) { out.push({ name, err:e.name }); }
+  }
+  return out;
+}
+
+async function env() {
+  const ua = navigator.userAgent;
+  const b = /Edg\//.test(ua) ? 'Edge' : /Firefox\//.test(ua) ? 'Firefox' : /Chrome\//.test(ua) ? 'Chrome' : 'other';
+  let v = (ua.match(/(?:Edg|Firefox|Chrome)\/([\d.]+)/) || [])[1] || '?';
+  // The reduced UA says 155.0.0.0. The real version comes from userAgentData.
+  try {
+    const hv = await navigator.userAgentData.getHighEntropyValues(['fullVersionList']);
+    const want = b === 'Edge' ? /Edge/ : /Chrome/;
+    const brand = hv.fullVersionList.find(x => want.test(x.brand) && !/Not/.test(x.brand));
+    if (brand) v = brand.version;
+  } catch {}
+  return {
+    browser: `${b} ${v}`,
+    secure: isSecureContext,
+    origin: location.origin,
+    screen: `${Math.round(screen.width * devicePixelRatio)}x${Math.round(screen.height * devicePixelRatio)} @${devicePixelRatio}`,
+    hdr: matchMedia('(dynamic-range: high)').matches,
+    ua
+  };
+}
+
+function notes(e, res) {
+  const n = [];
+  const hw = res.filter(r => r.hw && r.ok);
+  const rel = res.filter(reliable);
+  if (!e.secure) n.push(['w', 'Not a secure context. Serve the page over https or localhost.']);
+  if (/Edge/.test(e.browser) && !hw.length)
+    n.push(['w', 'Edge has no hardware PlayReady here. Usual causes: InPrivate window, hardware acceleration turned off, or the GPU driver. Without it, streaming services cap the quality.']);
+  if (!/Edge/.test(e.browser) && !hw.length)
+    n.push(['g', 'This browser has no hardware DRM on Windows. Expected in Chrome and Firefox: they top out around 720p no matter the display.']);
+  if (!rel.length) { n.push(['w', 'No profile passed the control query. The HDCP result is not conclusive.']); return n; }
+
+  const best = rel.filter(r => r.hw).concat(rel.filter(r => !r.hw))[0];
+  const m = maxOk(best.hdcp);
+  if (!m) {
+    n.push(['n', `${best.name}: the CDM answers but can't enforce even HDCP 1.0. The link is not negotiating HDCP (display, cable, port or HDMI mode).`]);
+    if (rel.every(r => !maxOk(r.hdcp)))
+      n.push(['g', 'All profiles agree. Run the real license test below to confirm it is not a false negative.']);
+  } else if (m >= '2.2') n.push(['y', `${best.name}: HDCP ${m}. Enough for 4K.`]);
+  else n.push(['w', `${best.name}: HDCP ${m}. Enough for 1080p, not for 4K (needs 2.2).`]);
+
+  const pr = res.find(r => r.id === 'pr-3000');
+  if (pr && pr.ok && pr.hevc === false) n.push(['w', 'Hardware PlayReady without HEVC: install "HEVC Video Extensions" from the Microsoft Store.']);
+  return n;
+}
+
+function textReport(d) {
+  const L = ['hdcp-probe report', `date      : ${d.date}`];
+  if (d.env) L.push(`browser   : ${d.env.browser}`, `screen    : ${d.env.screen}  hdr=${d.env.hdr}`, `secure    : ${d.env.secure}  origin=${d.env.origin}`);
+  if (d.license) {
+    L.push('', 'real license test (PlayReady test server):');
+    for (const r of d.license) L.push(`  ${r.ks.endsWith('.3000') ? 'HW' : 'SW'} | ${r.name.padEnd(24)} | ${r.result.padEnd(12)} | ${r.detail}`);
+  }
+  if (d.profiles) {
+    L.push('', 'policy query:');
+    for (const r of d.profiles) {
+      L.push(`  [${r.name}] ${r.ok ? 'ok' : 'not available'}${r.ks ? '  ks=' + r.ks : ''}`);
+      if (r.err) L.push(`    error: ${r.err}`);
+      if (r.ok) {
+        L.push(`    hevc=${r.hevc}  control=${r.control}  max=${reliable(r) ? (maxOk(r.hdcp) || 'none') : 'unreliable'}  ${r.ms}ms`);
+        L.push('    ' + VERSIONS.map(v => `${v}:${r.hdcp[v] === 'usable' ? 'ok' : 'x'}`).join(' '));
+      }
+    }
+    for (const x of d.decoding) L.push(`  decode ${x.name}: ${x.err || `supported=${x.supported} smooth=${x.smooth} hw=${x.hw}`}`);
+    L.push('', 'notes:', ...d.notes.map(([, t]) => '  - ' + t));
+  }
+  return L.join('\n');
+}
+
+let data = null;
+function enableCopy() {
+  document.getElementById('txt').disabled = false;
+  document.getElementById('json').disabled = false;
+}
+
+document.getElementById('run').onclick = async () => {
+  const out = document.getElementById('out');
+  out.innerHTML = '<p class="g">running...</p>';
+  const e = await env();
+  const profiles = [];
+  for (const p of PROFILES) profiles.push(await probe(p));
+  const decoding = await decodeInfo();
+  data = Object.assign(data || {}, { date: new Date().toISOString(), env: e, profiles, decoding, notes: notes(e, profiles) });
+
+  let h = '<h2>Result</h2><ul>' + data.notes.map(([k, t]) => `<li class="${k}">${t}</li>`).join('') + '</ul>';
+
+  h += '<h2>Environment</h2><table>' +
+    `<tr><th>browser</th><td>${esc(e.browser)}</td></tr>` +
+    `<tr><th>screen</th><td>${e.screen}${e.hdr ? ' HDR' : ''}</td></tr>` +
+    `<tr><th>secure context</th><td class="${e.secure ? 'y' : 'w'}">${e.secure}</td></tr></table>`;
+
+  h += '<h2>DRM</h2><div class="scroll"><table><tr><th>profile</th><th>status</th><th>key system</th><th>HEVC</th><th>control</th><th>max HDCP</th><th>ms</th></tr>';
+  for (const r of profiles) {
+    const m = reliable(r) ? (maxOk(r.hdcp) || 'none') : (r.ok ? 'unreliable' : '');
+    h += `<tr><td>${r.name}</td><td class="${r.ok ? 'y' : 'g'}">${r.ok ? 'ok' : 'no'}</td><td class="g">${r.ks || ''}</td>` +
+      `<td class="${r.hevc ? 'y' : r.hevc === false ? 'n' : 'g'}">${r.hevc == null ? '' : r.hevc}</td>` +
+      `<td class="${c(r.control)}">${r.control || ''}</td><td>${m}</td><td class="g">${r.ok ? r.ms : ''}</td></tr>`;
+  }
+  h += '</table></div>';
+
+  const ok = profiles.filter(r => r.ok && Object.keys(r.hdcp).length);
+  if (ok.length) {
+    h += '<h2>HDCP by version</h2><div class="scroll"><table><tr><th>min</th>' + ok.map(r => `<th>${r.name}</th>`).join('') + '</tr>';
+    for (const v of VERSIONS) h += `<tr><td>${v}</td>` + ok.map(r => `<td class="${c(r.hdcp[v])}">${r.hdcp[v]}</td>`).join('') + '</tr>';
+    h += '</table></div>';
+  }
+
+  const bad = profiles.filter(r => r.err);
+  if (bad.length) h += '<h2>Errors</h2><pre>' + bad.map(r => esc(`${r.name}: ${r.err}`)).join('\n') + '</pre>';
+
+  if (decoding.length) {
+    h += '<h2>Decoding (no DRM)</h2><table><tr><th>format</th><th>supported</th><th>smooth</th><th>hw</th></tr>';
+    for (const x of decoding) h += x.err ? `<tr><td>${x.name}</td><td colspan="3" class="g">${x.err}</td></tr>` :
+      `<tr><td>${x.name}</td><td class="${x.supported ? 'y' : 'n'}">${x.supported}</td><td>${x.smooth}</td><td>${x.hw}</td></tr>`;
+    h += '</table>';
+  }
+
+  h += '<p class="g" style="margin-top:12px">"control" is the query without any HDCP requirement. If it comes back restricted, that profile can\'t measure anything. ' +
+       'Spec: <a href="https://wicg.github.io/hdcp-detection/">WICG hdcp-detection</a>.</p>';
+
+  out.innerHTML = h;
+  enableCopy();
+};
+
+async function copy(btn, s) {
+  try { await navigator.clipboard.writeText(s); const t = btn.textContent; btn.textContent = 'copied'; setTimeout(() => btn.textContent = t, 1200); }
+  catch { prompt('Copy:', s); }
+}
+document.getElementById('txt').onclick  = e => copy(e.target, textReport(data));
+document.getElementById('json').onclick = e => copy(e.target, JSON.stringify(data, null, 2));
+</script>
+
+<script src="https://cdn.jsdelivr.net/npm/shaka-player@4/dist/shaka-player.compiled.js"></script>
+<script>
+'use strict';
+// Microsoft's public PlayReady test server and content:
+// https://learn.microsoft.com/playready/advanced/testservers/query-string-syntax
+// https://learn.microsoft.com/playready/advanced/testcontent/playready-2x-test-content
+const LIC_MANIFEST = 'https://test.playready.microsoft.com/media/profficialsite/tearsofsteel_4k.ism/manifest.mpd';
+
+// Known test server endpoints. Tried in order with the control case; the first one
+// that hands out a working license is used for the HDCP cases.
+// Plain http only works when the page itself is served over http (mixed content).
+const LIC_SERVERS = [
+  'https://test.playready.microsoft.com/service/rightsmanager.asmx?cfg=',
+  'https://test.playready.microsoft.com/core/rightsmanager.asmx?cfg=',
+  'https://playready.directtaps.net/pr/svc/rightsmanager.asmx?cfg=',
+  'http://test.playready.microsoft.com/service/rightsmanager.asmx?cfg=',
+].filter(u => location.protocol === 'http:' || u.startsWith('https:'));
+
+// ucvopl:300 = uncompressed digital video output only passes with HDCP engaged.
+// The dvop GUID adds an explicit HDCP Type 1 requirement (2.2 and up).
+const HDCP_TYPE1 = 'dvop:(guid:ABB2C6F1-E663-4625-A945-972D17B231E7,data:AAAAAQ==)';
+const LIC_CASES = [
+  { id:'ctrl',  name:'control (no requirement)', cfg:'(persist:false,sl:150)' },
+  { id:'hdcp',  name:'requires HDCP (any)',      cfg:'(persist:false,sl:150,ucvopl:300)' },
+  { id:'hdcp2', name:'requires HDCP 2.2',        cfg:`(persist:false,sl:150,ucvopl:300,${HDCP_TYPE1})` },
+];
+
+const LIC_TIMEOUT = 25000; // HDCP 2.2 can take several seconds to engage
+const LIC_PLAY_OK = 2;     // seconds of playback that count as a pass
+
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+// Unwraps a nested shaka.util.Error down to the real network error.
+function shakaWhy(e, depth = 0) {
+  if (!e || depth > 4) return '';
+  const names = { 1001:'bad HTTP status', 1002:'network or CORS error', 1003:'timeout', 6001:'key system not supported', 6007:'license request failed', 6008:'license rejected by CDM', 4012:'restrictions cannot be met' };
+  const code = e.code;
+  let s = code ? `${code}${names[code] ? ' (' + names[code] + ')' : ''}` : (e.message || String(e));
+  const d = Array.isArray(e.data) ? e.data : [];
+  if (code === 1001) {
+    const body = String(d[2] || '').replace(/\s+/g, ' ').slice(0, 160);
+    s += `: HTTP ${d[1]}${body ? ' ' + body : ''}`;
+  } else if (code === 1002 && d[1]) s += `: ${d[1].message || d[1]}`;
+  const inner = d.find(x => x && typeof x === 'object' && 'code' in x && 'category' in x);
+  if (inner) s += ' <- ' + shakaWhy(inner, depth + 1);
+  return s;
+}
+
+async function licRun(ks, test, video, base) {
+  const r = { ks, case: test.id, name: test.name, server: base.split('?')[0], result: 'inconclusive', detail: '', keys: {}, played: 0, height: 0, ms: 0, licHits: [] };
+  const t0 = performance.now();
+  const player = new shaka.Player();
+  let err = null;
+  player.addEventListener('error', e => { err = e.detail; });
+  try {
+    await player.attach(video);
+    const laUrl = base + test.cfg;
+    // The test manifest embeds an old LA_URL (Azure Media Services, no longer resolves).
+    // Force every license request to our URL no matter what the manifest says.
+    player.getNetworkingEngine().registerRequestFilter((type, req) => {
+      if (type === shaka.net.NetworkingEngine.RequestType.LICENSE) {
+        r.licHits.push(req.uris[0]);
+        req.uris = [laUrl];
+      }
+    });
+    const servers = {};
+    for (const k of ['com.microsoft.playready', 'com.microsoft.playready.recommendation', 'com.microsoft.playready.recommendation.3000']) servers[k] = laUrl;
+    player.configure({
+      drm: { servers, keySystemsMapping: { 'com.microsoft.playready': ks }, preferredKeySystems: [ks] },
+      restrictions: { maxHeight: 1080 },
+      streaming: { bufferingGoal: 6, rebufferingGoal: 1 },
+    });
+    await player.load(LIC_MANIFEST);
+    video.play().catch(() => {});
+
+    while (performance.now() - t0 < LIC_TIMEOUT) {
+      await sleep(250);
+      r.keys = player.getKeyStatuses();
+      const st = Object.values(r.keys);
+      if (err) break;
+      if (st.includes('output-restricted') || st.includes('output-downscaled')) break;
+      if (video.currentTime >= LIC_PLAY_OK && st.length && st.every(s => s === 'usable')) break;
+    }
+  } catch (e) { err = e.detail || e; }
+
+  r.played = Math.round(video.currentTime * 10) / 10;
+  r.height = video.videoHeight;
+  r.ms = Math.round(performance.now() - t0);
+  const st = Object.values(r.keys);
+
+  if (st.includes('output-restricted')) { r.result = 'fail'; r.detail = 'license OK, output restricted (HDCP not good enough)'; }
+  else if (st.includes('output-downscaled')) { r.result = 'partial'; r.detail = 'plays, but downscaled by the output policy'; }
+  else if (err) {
+    const code = err.code || '';
+    r.code = code;
+    r.result = code === 4012 ? 'fail' : 'error';
+    r.detail = code === 4012 ? 'no variant meets the restrictions (HDCP)' : `shaka ${shakaWhy(err)}`;
+  }
+  else if (r.played >= LIC_PLAY_OK) { r.result = 'pass'; r.detail = `played ${r.played}s at ${r.height}p`; }
+  else r.detail = `no error, but stuck at ${r.played}s after ${LIC_TIMEOUT / 1000}s`;
+
+  try { await player.destroy(); } catch {}
+  video.removeAttribute('src'); video.load();
+  return r;
+}
+
+function licVerdict(rows) {
+  const n = [];
+  for (const ks of [...new Set(rows.map(r => r.ks))]) {
+    const mine = rows.filter(r => r.ks === ks);
+    const ctrl = mine.find(r => r.case === 'ctrl' && r.result === 'pass') || mine.filter(r => r.case === 'ctrl').pop();
+    const h = mine.find(r => r.case === 'hdcp'), h2 = mine.find(r => r.case === 'hdcp2');
+    const tag = ks.endsWith('.3000') ? 'HW' : 'SW';
+    if (!ctrl || ctrl.result !== 'pass') {
+      const why = ctrl ? ctrl.detail : '-';
+      const hint = /1002/.test(why) ? ' Looks like CORS or network: open F12 > Network, filter by "rightsmanager" and check the failed request.'
+                 : /1001/.test(why) ? ' The server answered with an HTTP error. It may be down or may have moved.' : '';
+      n.push(['w', `${tag}: no test server handed out a working license, so HDCP could not be measured.${hint} Last error: ${esc(why)}`]);
+      continue;
+    }
+    // Hardware PlayReady doesn't always report output-restricted. Sometimes it just
+    // freezes the video. If the control played on the same server, a freeze is a fail.
+    for (const x of [h, h2]) if (x && x.result === 'inconclusive' && x.played < 1) {
+      x.result = 'fail';
+      x.detail += ' (control played fine, so the freeze means HDCP did not engage)';
+    }
+    if (!h) continue;
+    if (h.result === 'pass' && h2 && h2.result === 'pass') n.push(['y', `${tag}: HDCP 2.2 works. Good for 4K.`]);
+    else if (h.result === 'pass') n.push(['w', `${tag}: HDCP 1.x works, 2.2 doesn't. Good for 1080p, not for 4K.`]);
+    else if (h.result === 'fail') n.push(['n', `${tag}: no HDCP with a real license either. The problem is the link or the display, not the test.`]);
+    else n.push(['g', `${tag}: HDCP result inconclusive (${esc(h.detail)}).`]);
+  }
+  return n;
+}
+
+document.getElementById('lic-run').onclick = async () => {
+  const out = document.getElementById('lic-out');
+  const video = document.getElementById('lic-video');
+  if (typeof shaka === 'undefined') { out.innerHTML = '<p class="n">Could not load shaka-player from the CDN.</p>'; return; }
+  shaka.polyfill.installAll();
+  if (!shaka.Player.isBrowserSupported()) { out.innerHTML = '<p class="n">This browser lacks EME/MSE support.</p>'; return; }
+
+  const kss = [];
+  if (document.getElementById('lic-hw').checked) kss.push('com.microsoft.playready.recommendation.3000');
+  if (document.getElementById('lic-sw').checked) kss.push('com.microsoft.playready.recommendation');
+  if (!kss.length) return;
+
+  const btn = document.getElementById('lic-run');
+  btn.disabled = true;
+  const rows = [];
+  const draw = busy => {
+    const verdict = busy ? null : licVerdict(rows); // may reclassify rows, so it runs before the table
+    let h = '<div class="scroll"><table><tr><th>DRM</th><th>case</th><th>server</th><th>result</th><th>detail</th><th>ms</th></tr>';
+    for (const r of rows) {
+      const k = r.result === 'pass' ? 'y' : r.result === 'fail' ? 'n' : r.result === 'partial' ? 'w' : 'g';
+      const host = r.server.replace(/^https?:\/\//, '').replace('/rightsmanager.asmx', '');
+      h += `<tr><td>${r.ks.endsWith('.3000') ? 'HW SL3000' : 'SW SL2000'}</td><td>${r.name}</td><td class="g">${r.server.startsWith('http:') ? 'http ' : ''}${host}</td><td class="${k}">${r.result}</td><td>${esc(r.detail)}</td><td class="g">${r.ms}</td></tr>`;
+    }
+    h += '</table></div>';
+    h += busy ? `<p class="g">${busy}</p>` : '<ul>' + verdict.map(([k, t]) => `<li class="${k}">${t}</li>`).join('') + '</ul>';
+    out.innerHTML = h;
+  };
+
+  for (const ks of kss) {
+    const tag = ks.endsWith('.3000') ? 'HW' : 'SW';
+    // 1) Find a server where the control case plays.
+    let base = null;
+    for (const s of LIC_SERVERS) {
+      draw(`${tag}: trying server ${s.split('?')[0]}...`);
+      const ctrl = await licRun(ks, LIC_CASES[0], video, s);
+      rows.push(ctrl);
+      if (ctrl.result === 'pass') { base = s; break; }
+      // If the failure isn't the license request itself, switching servers won't help.
+      if (ctrl.code && ctrl.code !== 6007) break;
+    }
+    if (!base) continue;
+    // 2) Run the HDCP cases on that server.
+    for (const t of LIC_CASES.slice(1)) {
+      draw(`${tag}: ${t.name}...`);
+      rows.push(await licRun(ks, t, video, base));
+    }
+  }
+  draw(null);
+  data = Object.assign(data || { date: new Date().toISOString() }, { license: rows });
+  if (!data.env) data.env = await env();
+  enableCopy();
+  btn.disabled = false;
+};
+</script>
+</body>
+</html>
