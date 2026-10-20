@@ -1,0 +1,28 @@
+name: Bug
+description: The page itself is broken or gives a wrong result
+labels: ["bug"]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you expected vs what you got
+    validations:
+      required: true
+  - type: textarea
+    id: report
+    attributes:
+      label: hdcp-probe report or JSON
+      render: text
+  - type: textarea
+    id: console
+    attributes:
+      label: Console errors (F12 > Console)
+      render: text
+  - type: input
+    id: browser
+    attributes:
+      label: Browser and OS
+      placeholder: Edge 155.0.4283.62, Windows 11 26300
+    validations:
+      required: true
