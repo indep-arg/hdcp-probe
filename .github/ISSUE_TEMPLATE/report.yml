@@ -1,0 +1,64 @@
+name: Result report
+description: Share what hdcp-probe found on your setup
+title: "[report] <GPU> + <display> via <HDMI/DP>"
+labels: ["report"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks! Results from different setups help figure out which hardware breaks HDCP and where the policy query lies.
+        Run both tests in Edge (normal window), click **Copy report** and paste it below.
+  - type: input
+    id: gpu
+    attributes:
+      label: GPU and driver version
+      placeholder: RTX 3070, 32.0.16.1692
+    validations:
+      required: true
+  - type: input
+    id: display
+    attributes:
+      label: Display (brand and model)
+      placeholder: Samsung..
+    validations:
+      required: true
+  - type: dropdown
+    id: link
+    attributes:
+      label: Connection
+      options:
+        - HDMI
+        - DisplayPort
+        - USB-C / Thunderbolt
+        - Adapter (say which below)
+    validations:
+      required: true
+  - type: input
+    id: extras
+    attributes:
+      label: Anything in between?
+      description: Cable type, adapter, KVM, capture card, AV receiver, other displays connected
+  - type: dropdown
+    id: streaming
+    attributes:
+      label: What do streaming services give you?
+      description: In Netflix on Edge, Ctrl+Alt+Shift+D shows the resolution
+      options:
+        - Did not check
+        - 540p or less
+        - 720p
+        - 1080p
+        - 4K
+  - type: textarea
+    id: report
+    attributes:
+      label: hdcp-probe report
+      description: Paste the output of "Copy report"
+      render: text
+    validations:
+      required: true
+  - type: textarea
+    id: notes
+    attributes:
+      label: Notes
+      description: Anything you changed that made a difference (port, cable, OSD setting...)
